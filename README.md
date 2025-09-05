@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> Microsoft recently released VibeVoice, a high-quality conversational TTS model, but has since deleted the official GitHub repository and removed the 7B model from Hugging Face.
+> This project serves as a community-maintained backup of the original source code for preservation.
+> 
+> *   **7B Model Weights**: The original 7B model weights have been re-uploaded for accessibility here: [VibeVoice-Large-7B](https://www.modelscope.cn/models/microsoft/VibeVoice-Large)
+> *   **Live Demo**: To experience the inference capabilities of the VibeVoice 7B model directly via a web UI, visit our online service: **https://vibevoice.info**
+
 <div align="center">
 
 ## 🎙️ VibeVoice: A Frontier Long Conversational Text-to-Speech Model
@@ -5,7 +12,7 @@
 [![Hugging Face](https://img.shields.io/badge/HuggingFace-Collection-orange?logo=huggingface)](https://huggingface.co/collections/microsoft/vibevoice-68a2ef24a875c44be47b034f)
 [![Technical Report](https://img.shields.io/badge/Technical-Report-red?logo=adobeacrobatreader)](https://arxiv.org/pdf/2508.19205)
 [![Colab](https://img.shields.io/badge/Run-Colab-orange?logo=googlecolab)](https://colab.research.google.com/github/akadoubleone/VibeVoice-Community/blob/main/demo/VibeVoice_colab.ipynb)
-[![Live Playground](https://img.shields.io/badge/Live-Playground-green?logo=gradio)](https://aka.ms/VibeVoice-Demo)
+[![Live Playground](https://img.shields.io/badge/Live-Playground-green?logo=gradio)](https://v.vibevoice.info)
 
 </div>
 <!-- <div align="center">
@@ -33,7 +40,7 @@ The model can synthesize speech up to **90 minutes** long with up to **4 distinc
 
 ### 🔥 News
 
-- **[2025-08-26] 🎉 We Open Source the [VibeVoice-Large](https://huggingface.co/aoi-ot/VibeVoice-Large) model weights!**
+- **[2025-08-26] 🎉 We Open Source the [VibeVoice-Large](https://www.modelscope.cn/models/microsoft/VibeVoice-Large) model weights!**
 - **[2025-08-28] 🎉 We provide a [Colab](https://colab.research.google.com/github/akadoubleone/VibeVoice-Community/blob/main/demo/VibeVoice_colab.ipynb) script for easy access to our model. Due to GPU memory limitations, only VibeVoice-1.5B is supported.**
 
 ### 📋 TODO
@@ -44,52 +51,9 @@ The model can synthesize speech up to **90 minutes** long with up to **4 distinc
 
 ### 🎵 Demo Examples
 
-
-**Video Demo**
-
-We produced this video with [Wan2.2](https://github.com/Wan-Video/Wan2.2). We sincerely appreciate the Wan-Video team for their great work.
-
-**English**
-<div align="center">
-
-https://github.com/user-attachments/assets/0967027c-141e-4909-bec8-091558b1b784
-
-</div>
-
-
-**Chinese**
-<div align="center">
-
-https://github.com/user-attachments/assets/322280b7-3093-4c67-86e3-10be4746c88f
-
-</div>
-
-**Cross-Lingual**
-<div align="center">
-
-https://github.com/user-attachments/assets/838d8ad9-a201-4dde-bb45-8cd3f59ce722
-
-</div>
-
-**Spontaneous Singing**
-<div align="center">
-
-https://github.com/user-attachments/assets/6f27a8a5-0c60-4f57-87f3-7dea2e11c730
-
-</div>
-
-
-**Long Conversation with 4 people**
-<div align="center">
-
-https://github.com/user-attachments/assets/a357c4b6-9768-495c-a576-1618f6275727
-
-</div>
+**Live Demo**: To experience the inference capabilities of the VibeVoice 7B model directly via a web UI, visit our online service: **https://vibevoice.info**
 
 For more examples, see the [Project Page](https://microsoft.github.io/VibeVoice).
-
-Try it on [Colab](https://colab.research.google.com/github/akadoubleone/VibeVoice-Community/blob/main/demo/VibeVoice_colab.ipynb) or [Demo](https://aka.ms/VibeVoice-Demo).
-
 
 
 ## Models
@@ -97,7 +61,7 @@ Try it on [Colab](https://colab.research.google.com/github/akadoubleone/VibeVoic
 |-------|----------------|----------|----------|
 | VibeVoice-0.5B-Streaming | - | - | On the way |
 | VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |
-| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/aoi-ot/VibeVoice-Large) |
+| VibeVoice-Large| 32K | ~45 min | [HF link](https://www.modelscope.cn/models/microsoft/VibeVoice-Large) |
 
 ## Installation
 We recommend to use NVIDIA Deep Learning Container to manage the CUDA environment. 
@@ -115,7 +79,7 @@ sudo docker run --privileged --net=host --ipc=host --ulimit memlock=-1:-1 --ulim
 
 2. Install from github
 ```bash
-git clone https://github.com/microsoft/VibeVoice.git
+git clone https://github.com/shijincai/VibeVoice.git
 cd VibeVoice/
 
 pip install -e .
@@ -140,17 +104,17 @@ apt update && apt install ffmpeg -y # for demo
 python demo/gradio_demo.py --model_path microsoft/VibeVoice-1.5B --share
 
 # For Large model
-python demo/gradio_demo.py --model_path aoi-ot/VibeVoice-Large --share
+python demo/gradio_demo.py --model_path microsoft/VibeVoice-Large --share
 ```
 
 ### Usage 2: Inference from files directly
 ```bash
 # We provide some LLM generated example scripts under demo/text_examples/ for demo
 # 1 speaker
-python demo/inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
+python demo/inference_from_file.py --model_path microsoft/VibeVoice-Large --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
 
 # or more speakers
-python demo/inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
+python demo/inference_from_file.py --model_path microsoft/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
 ```
 
 ## FAQ

@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> Microsoft recently released VibeVoice, a high-quality conversational TTS model, but has since deleted the official GitHub repository and removed the 7B model from Hugging Face.
+> Microsoft recently released VibeVoice, a high-quality conversational TTS model, but has since deleted the official GitHub repository and removed the 7B model from Modelscope.
 > This project serves as a community-maintained backup of the original source code for preservation.
 > 
 > *   **7B Model Weights**: The original 7B model weights have been re-uploaded for accessibility here: [VibeVoice-Large-7B](https://www.modelscope.cn/models/microsoft/VibeVoice-Large)

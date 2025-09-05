@@ -3,7 +3,7 @@
 > This project serves as a community-maintained backup of the original source code for preservation.
 > 
 > *   **7B Model Weights**: The original 7B model weights have been re-uploaded for accessibility here: [VibeVoice-Large-7B](https://www.modelscope.cn/models/microsoft/VibeVoice-Large)
-> *   **Live Demo**: To experience the inference capabilities of the VibeVoice 7B model directly via a web UI, visit our online service: **https://vibevoice.info**
+> *   **Live Demo**: To experience the inference capabilities of the VibeVoice 1.5B or 7B model directly via a web UI, visit our online service: **https://vibevoice.info**
 
 <div align="center">
 

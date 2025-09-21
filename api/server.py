@@ -326,9 +326,12 @@ class VibeVoiceTTS:
 
         audio = speech_outputs[0]
         if isinstance(audio, torch.Tensor):
-            waveform = audio.detach().cpu().numpy()
+            waveform_tensor = audio.detach()
+            if waveform_tensor.dtype != torch.float32:
+                waveform_tensor = waveform_tensor.to(torch.float32)
+            waveform = waveform_tensor.cpu().numpy()
         else:
-            waveform = np.asarray(audio)
+            waveform = np.asarray(audio, dtype=np.float32)
 
         if waveform.ndim > 1:
             waveform = waveform.squeeze()

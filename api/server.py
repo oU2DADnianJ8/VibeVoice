@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import asyncio.subprocess
+import contextlib
 import io
 import logging
 import os
 import threading
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -24,6 +29,7 @@ from pydub.exceptions import CouldntEncodeError
 from vibevoice.modular.modeling_vibevoice_inference import (
     VibeVoiceForConditionalGenerationInference,
 )
+from vibevoice.modular.streamer import AsyncAudioStreamer
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
 logger = logging.getLogger("vibevoice.api.server")
@@ -33,6 +39,12 @@ SUPPORTED_RESPONSE_FORMATS: Dict[str, Tuple[str, str]] = {
     "mp3": ("audio/mpeg", "mp3"),
     "wav": ("audio/wav", "wav"),
     "flac": ("audio/flac", "flac"),
+}
+
+FFMPEG_OUTPUT_ARGS: Dict[str, List[str]] = {
+    "mp3": ["-f", "mp3", "-acodec", "libmp3lame", "-b:a", "192k"],
+    "wav": ["-f", "wav", "-acodec", "pcm_s16le"],
+    "flac": ["-f", "flac", "-acodec", "flac"],
 }
 
 
@@ -59,6 +71,7 @@ class ServerConfig:
     voices_dir: Path
     default_cfg_scale: float
     inference_steps: int
+    output_dir: Path
 
 
 class VoiceLibrary:
@@ -276,12 +289,7 @@ class VibeVoiceTTS:
             return []
         return self.voice_library.list_voices()
 
-    def synthesize_waveform(
-        self,
-        text: str,
-        voice_name: str,
-        cfg_scale: Optional[float] = None,
-    ) -> Tuple[np.ndarray, int]:
+    def _prepare_generation_inputs(self, text: str, voice_name: str) -> Dict[str, torch.Tensor]:
         if not text.strip():
             raise ValueError("Input text must not be empty.")
         if not self.voice_library:
@@ -289,9 +297,6 @@ class VibeVoiceTTS:
 
         voice_audio = self.voice_library.get(voice_name)
         formatted_text = self._format_text(text)
-        cfg_scale = cfg_scale if cfg_scale is not None else self.default_cfg_scale
-        if cfg_scale <= 0:
-            raise ValueError("cfg_scale must be greater than zero.")
 
         inputs = self.processor(
             text=[formatted_text],
@@ -305,6 +310,20 @@ class VibeVoiceTTS:
         for key, value in inputs.items():
             if torch.is_tensor(value):
                 inputs[key] = value.to(target_device)
+
+        return inputs
+
+    def synthesize_waveform(
+        self,
+        text: str,
+        voice_name: str,
+        cfg_scale: Optional[float] = None,
+    ) -> Tuple[np.ndarray, int]:
+        cfg_scale = cfg_scale if cfg_scale is not None else self.default_cfg_scale
+        if cfg_scale <= 0:
+            raise ValueError("cfg_scale must be greater than zero.")
+
+        inputs = self._prepare_generation_inputs(text, voice_name)
 
         assert self.model is not None  # for type checkers
 
@@ -398,6 +417,225 @@ class VibeVoiceTTS:
             channels=1,
         )
 
+    async def _start_encoder_process(self, fmt: str) -> asyncio.subprocess.Process:
+        ffmpeg_args = FFMPEG_OUTPUT_ARGS.get(fmt)
+        if ffmpeg_args is None:
+            raise ValueError(
+                f"Unsupported response_format '{fmt}'. Supported values: {', '.join(FFMPEG_OUTPUT_ARGS)}"
+            )
+
+        try:
+            return await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-f",
+                "f32le",
+                "-ar",
+                str(self.sample_rate),
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                *ffmpeg_args,
+                "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:  # pragma: no cover - runtime dependency on ffmpeg
+            raise AudioConversionError(
+                "FFmpeg is required for streaming responses. Ensure it is installed and available in PATH."
+            ) from exc
+
+    def _prepare_stream_chunk(self, chunk: object) -> bytes:
+        if isinstance(chunk, torch.Tensor):
+            if chunk.dtype != torch.float32:
+                chunk = chunk.to(torch.float32)
+            array = chunk.detach().cpu().numpy()
+        else:
+            array = np.asarray(chunk, dtype=np.float32)
+
+        if array.ndim > 1:
+            array = array.squeeze()
+
+        if array.size == 0:
+            return b""
+
+        clipped = np.clip(array, -1.0, 1.0).astype(np.float32)
+        return np.ascontiguousarray(clipped).tobytes()
+
+    def _build_mp3_bytes(self, audio_bytes: bytes, source_extension: str) -> bytes:
+        source_extension = source_extension.lower()
+        if source_extension == "mp3":
+            return audio_bytes
+
+        try:
+            buffer = io.BytesIO(audio_bytes)
+            segment = AudioSegment.from_file(buffer, format=source_extension)
+            output = io.BytesIO()
+            segment.export(output, format="mp3")
+            return output.getvalue()
+        except CouldntEncodeError as exc:  # pragma: no cover - depends on ffmpeg availability
+            raise AudioConversionError(
+                "Failed to encode MP3 audio. Ensure FFmpeg is installed and available in PATH."
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - log unexpected conversion failures
+            raise AudioConversionError(f"Failed to convert audio to MP3: {exc}") from exc
+
+    def _save_output_file(self, audio_bytes: bytes, extension: str, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        filename = f"speech_{timestamp}_{uuid.uuid4().hex[:8]}.{extension}"
+        output_path = output_dir / filename
+        output_path.write_bytes(audio_bytes)
+        logger.info("Saved synthesized audio to %s", output_path)
+        return output_path
+
+    def save_audio_output(self, audio_bytes: bytes, source_extension: str, output_dir: Path) -> Path:
+        mp3_bytes = self._build_mp3_bytes(audio_bytes, source_extension)
+        return self._save_output_file(mp3_bytes, "mp3", output_dir)
+
+    def _generate_with_streamer(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        cfg_scale: float,
+        audio_streamer: AsyncAudioStreamer,
+    ) -> None:
+        assert self.model is not None  # for type checkers
+        generation_inputs = {key: value for key, value in inputs.items()}
+
+        try:
+            with self._generation_lock:
+                with torch.no_grad():
+                    self.model.generate(
+                        **generation_inputs,
+                        max_new_tokens=None,
+                        cfg_scale=cfg_scale,
+                        tokenizer=self.processor.tokenizer,
+                        generation_config={"do_sample": False},
+                        audio_streamer=audio_streamer,
+                        verbose=False,
+                        refresh_negative=True,
+                    )
+        finally:
+            with contextlib.suppress(Exception):
+                audio_streamer.end()
+
+    async def stream_to_format(
+        self,
+        text: str,
+        voice_name: str,
+        response_format: str,
+        cfg_scale: Optional[float],
+        output_dir: Path,
+    ) -> Tuple[AsyncIterator[bytes], str, str]:
+        cfg_scale = cfg_scale if cfg_scale is not None else self.default_cfg_scale
+        if cfg_scale <= 0:
+            raise ValueError("cfg_scale must be greater than zero.")
+
+        fmt = response_format.lower()
+        if fmt not in SUPPORTED_RESPONSE_FORMATS:
+            raise ValueError(
+                f"Unsupported response_format '{response_format}'. Supported values: {', '.join(SUPPORTED_RESPONSE_FORMATS)}"
+            )
+
+        media_type, extension = SUPPORTED_RESPONSE_FORMATS[fmt]
+        inputs = self._prepare_generation_inputs(text, voice_name)
+        audio_streamer = AsyncAudioStreamer(batch_size=1, stop_signal=None, timeout=None)
+
+        process = await self._start_encoder_process(fmt)
+
+        async def run_generation() -> None:
+            await asyncio.to_thread(self._generate_with_streamer, inputs, cfg_scale, audio_streamer)
+
+        generation_task = asyncio.create_task(run_generation())
+        buffer = bytearray()
+
+        async def feed_encoder() -> None:
+            try:
+                async for chunk in audio_streamer.get_stream(0):
+                    pcm_bytes = self._prepare_stream_chunk(chunk)
+                    if not pcm_bytes:
+                        continue
+                    if process.stdin is None:
+                        raise AudioConversionError("FFmpeg stdin is not available.")
+                    process.stdin.write(pcm_bytes)
+                    await process.stdin.drain()
+            except asyncio.CancelledError:
+                raise
+            except AudioConversionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - capture encoder streaming errors
+                raise AudioConversionError(f"Failed to stream audio to encoder: {exc}") from exc
+            finally:
+                if process.stdin is not None and not process.stdin.is_closing():
+                    try:
+                        process.stdin.write_eof()
+                    except (AttributeError, OSError, RuntimeError):
+                        pass
+                    try:
+                        await process.stdin.drain()
+                    except Exception:  # noqa: BLE001 - drain best effort
+                        pass
+                    process.stdin.close()
+                    if hasattr(process.stdin, "wait_closed"):
+                        with contextlib.suppress(Exception):
+                            await process.stdin.wait_closed()
+
+        async def generator() -> AsyncIterator[bytes]:
+            feed_task = asyncio.create_task(feed_encoder())
+            try:
+                while True:
+                    if process.stdout is None:
+                        raise AudioConversionError("FFmpeg stdout is not available.")
+                    chunk = await process.stdout.read(4096)
+                    if chunk:
+                        buffer.extend(chunk)
+                        yield chunk
+                    else:
+                        break
+
+                await feed_task
+                await generation_task
+
+                returncode = await process.wait()
+                if returncode != 0:
+                    stderr_output = b""
+                    if process.stderr is not None:
+                        stderr_output = await process.stderr.read()
+                    message = stderr_output.decode("utf-8", "ignore").strip()
+                    raise AudioConversionError(
+                        f"FFmpeg exited with status {returncode}: {message}" if message else f"FFmpeg exited with status {returncode}"
+                    )
+
+                mp3_bytes = await asyncio.to_thread(self._build_mp3_bytes, bytes(buffer), extension)
+                await asyncio.to_thread(self._save_output_file, mp3_bytes, "mp3", output_dir)
+            finally:
+                if not feed_task.done():
+                    feed_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await feed_task
+
+                if not generation_task.done():
+                    generation_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await generation_task
+
+                with contextlib.suppress(Exception):
+                    audio_streamer.end()
+
+                with contextlib.suppress(Exception):
+                    await process.wait()
+
+                if process.stderr is not None:
+                    with contextlib.suppress(Exception):
+                        await process.stderr.read()
+
+            return
+
+        return generator(), extension, media_type
+
 
 class SpeechRequest(BaseModel):
     """Request body for the OpenAI-compatible TTS endpoint."""
@@ -408,6 +646,7 @@ class SpeechRequest(BaseModel):
     response_format: Optional[str] = Field(default="mp3", description="Audio format of the response.")
     speed: Optional[float] = Field(default=None, description="Playback speed multiplier (currently unused).")
     cfg_scale: Optional[float] = Field(default=None, description="Override the default CFG scale for synthesis.")
+    stream: Optional[bool] = Field(default=True, description="Stream the audio response when True.")
 
     @validator("input")
     def _validate_input(cls, value: str) -> str:  # noqa: D401 - short validator doc
@@ -457,6 +696,8 @@ def _config_from_env() -> ServerConfig:
     inference_steps = int(os.environ.get("VIBEVOICE_INFERENCE_STEPS", "5"))
     voices_dir_env = os.environ.get("VIBEVOICE_VOICES_DIR")
     voices_dir = Path(voices_dir_env) if voices_dir_env else base_dir / "voices"
+    output_dir_env = os.environ.get("VIBEVOICE_OUTPUT_DIR")
+    output_dir = Path(output_dir_env) if output_dir_env else base_dir / "output"
 
     return ServerConfig(
         model_path=model_path,
@@ -466,6 +707,7 @@ def _config_from_env() -> ServerConfig:
         voices_dir=voices_dir,
         default_cfg_scale=cfg_scale,
         inference_steps=inference_steps,
+        output_dir=output_dir,
     )
 
 
@@ -473,6 +715,12 @@ def _config_from_env() -> ServerConfig:
 async def _startup_event() -> None:
     config = _startup_config or _config_from_env()
     app.state.config = config
+
+    try:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001 - surface initialization errors
+        logger.exception("Failed to create output directory '%s': %s", config.output_dir, exc)
+        raise
 
     try:
         app.state.tts = VibeVoiceTTS(
@@ -527,6 +775,8 @@ async def options_speech(request: Request) -> Response:
 async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get_tts_engine)) -> StreamingResponse:
     response_format = payload.response_format or "mp3"
     cfg_scale = _resolve_cfg_scale(payload.cfg_scale, app.state.config.default_cfg_scale)
+    stream_response = True if payload.stream is None else payload.stream
+    output_dir = app.state.config.output_dir
 
     logger.info(
         "Received synthesis request - model=%s voice=%s format=%s cfg_scale=%.2f speed=%s",
@@ -537,6 +787,33 @@ async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get
         payload.speed,
     )
 
+    if stream_response:
+        try:
+            stream_generator, extension, media_type = await tts.stream_to_format(
+                payload.input,
+                payload.voice,
+                response_format,
+                cfg_scale,
+                output_dir,
+            )
+        except VoiceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AudioConversionError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            logger.exception("Generation failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to synthesize speech.") from exc
+        except Exception as exc:  # noqa: BLE001 - catch all synthesis errors
+            logger.exception("Unexpected error during streaming synthesis: %s", exc)
+            raise HTTPException(status_code=500, detail="Unexpected error during synthesis.") from exc
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="speech.{extension}"',
+        }
+        return StreamingResponse(stream_generator, media_type=media_type, headers=headers)
+
     try:
         audio_bytes, extension, media_type = await run_in_threadpool(
             tts.synthesize_to_format,
@@ -545,6 +822,7 @@ async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get
             response_format,
             cfg_scale,
         )
+        await run_in_threadpool(tts.save_audio_output, audio_bytes, extension, output_dir)
     except VoiceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except AudioConversionError as exc:
@@ -558,10 +836,14 @@ async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get
         logger.exception("Unexpected error during synthesis: %s", exc)
         raise HTTPException(status_code=500, detail="Unexpected error during synthesis.") from exc
 
+    def _chunk_bytes(data: bytes, chunk_size: int = 64 * 1024):
+        for start in range(0, len(data), chunk_size):
+            yield data[start : start + chunk_size]
+
     headers = {
         "Content-Disposition": f'attachment; filename="speech.{extension}"',
     }
-    return StreamingResponse(iter([audio_bytes]), media_type=media_type, headers=headers)
+    return StreamingResponse(_chunk_bytes(audio_bytes), media_type=media_type, headers=headers)
 
 
 @app.get("/health", summary="Health check")
@@ -589,6 +871,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voices_dir", type=Path, default=Path(__file__).resolve().parent / "voices", help="Directory containing voice preset audio files.")
     parser.add_argument("--cfg_scale", type=float, default=1.3, help="Default CFG scale to use for synthesis.")
     parser.add_argument("--inference_steps", type=int, default=5, help="Number of diffusion inference steps.")
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "output",
+        help="Directory where synthesized audio files will be stored as MP3s.",
+    )
     return parser.parse_args()
 
 
@@ -606,6 +894,7 @@ def main() -> None:
         voices_dir=args.voices_dir,
         default_cfg_scale=args.cfg_scale,
         inference_steps=args.inference_steps,
+        output_dir=args.output_dir,
     )
 
     configure_app(config)

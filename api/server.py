@@ -5,13 +5,10 @@ import argparse
 import io
 import logging
 import os
-import re
 import threading
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-from uuid import uuid4
+from typing import Dict, List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -60,33 +57,8 @@ class ServerConfig:
     host: str
     port: int
     voices_dir: Path
-    output_dir: Path
     default_cfg_scale: float
     inference_steps: int
-
-
-def _sanitize_for_filename(value: str) -> str:
-    sanitized = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
-    return sanitized or "speech"
-
-
-def _chunk_bytes(data: bytes, chunk_size: int = 64 * 1024) -> Iterable[bytes]:
-    for start in range(0, len(data), chunk_size):
-        yield data[start : start + chunk_size]
-
-
-def _persist_mp3(output_dir: Path, audio_bytes: bytes, voice_name: str) -> Path:
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    identifier = uuid4().hex[:8]
-    safe_voice = _sanitize_for_filename(voice_name)
-    filename = f"{timestamp}_{safe_voice}_{identifier}.mp3"
-    output_path = output_dir / filename
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as mp3_file:
-        mp3_file.write(audio_bytes)
-
-    return output_path
 
 
 class VoiceLibrary:
@@ -434,7 +406,6 @@ class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text content to synthesize.")
     voice: str = Field(..., description="Voice preset name to use for synthesis.")
     response_format: Optional[str] = Field(default="mp3", description="Audio format of the response.")
-    stream: Optional[bool] = Field(default=True, description="Whether the response should use HTTP streaming.")
     speed: Optional[float] = Field(default=None, description="Playback speed multiplier (currently unused).")
     cfg_scale: Optional[float] = Field(default=None, description="Override the default CFG scale for synthesis.")
 
@@ -486,8 +457,6 @@ def _config_from_env() -> ServerConfig:
     inference_steps = int(os.environ.get("VIBEVOICE_INFERENCE_STEPS", "5"))
     voices_dir_env = os.environ.get("VIBEVOICE_VOICES_DIR")
     voices_dir = Path(voices_dir_env) if voices_dir_env else base_dir / "voices"
-    output_dir_env = os.environ.get("VIBEVOICE_OUTPUT_DIR")
-    output_dir = Path(output_dir_env) if output_dir_env else base_dir / "output"
 
     return ServerConfig(
         model_path=model_path,
@@ -495,7 +464,6 @@ def _config_from_env() -> ServerConfig:
         host=host,
         port=port,
         voices_dir=voices_dir,
-        output_dir=output_dir,
         default_cfg_scale=cfg_scale,
         inference_steps=inference_steps,
     )
@@ -505,7 +473,6 @@ def _config_from_env() -> ServerConfig:
 async def _startup_event() -> None:
     config = _startup_config or _config_from_env()
     app.state.config = config
-    config.output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         app.state.tts = VibeVoiceTTS(
@@ -557,30 +524,31 @@ async def options_speech(request: Request) -> Response:
 
 
 @app.post("/v1/audio/speech")
-async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get_tts_engine)) -> Response:
-    response_format = (payload.response_format or "mp3").lower()
-    streaming_enabled = True if payload.stream is None else bool(payload.stream)
+async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get_tts_engine)) -> StreamingResponse:
+    response_format = payload.response_format or "mp3"
     cfg_scale = _resolve_cfg_scale(payload.cfg_scale, app.state.config.default_cfg_scale)
 
     logger.info(
-        "Received synthesis request - model=%s voice=%s format=%s cfg_scale=%.2f speed=%s streaming=%s",
+        "Received synthesis request - model=%s voice=%s format=%s cfg_scale=%.2f speed=%s",
         payload.model,
         payload.voice,
         response_format,
         cfg_scale,
         payload.speed,
-        streaming_enabled,
     )
 
     try:
-        waveform, sample_rate = await run_in_threadpool(
-            tts.synthesize_waveform,
+        audio_bytes, extension, media_type = await run_in_threadpool(
+            tts.synthesize_to_format,
             payload.input,
             payload.voice,
+            response_format,
             cfg_scale,
         )
     except VoiceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AudioConversionError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -590,54 +558,10 @@ async def create_speech(payload: SpeechRequest, tts: VibeVoiceTTS = Depends(_get
         logger.exception("Unexpected error during synthesis: %s", exc)
         raise HTTPException(status_code=500, detail="Unexpected error during synthesis.") from exc
 
-    try:
-        audio_bytes, extension, media_type = await run_in_threadpool(
-            tts._convert_audio,
-            waveform,
-            sample_rate,
-            response_format,
-        )
-    except VoiceNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except AudioConversionError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        if response_format == "mp3":
-            mp3_bytes = audio_bytes
-        else:
-            mp3_bytes, _, _ = await run_in_threadpool(
-                tts._convert_audio,
-                waveform,
-                sample_rate,
-                "mp3",
-            )
-    except AudioConversionError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        saved_path = await run_in_threadpool(
-            _persist_mp3,
-            app.state.config.output_dir,
-            mp3_bytes,
-            payload.voice,
-        )
-        logger.info("Saved synthesized audio to %s", saved_path)
-    except Exception as exc:  # noqa: BLE001 - file system errors should be surfaced
-        logger.exception("Failed to persist generated audio: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to persist generated audio.") from exc
-
     headers = {
         "Content-Disposition": f'attachment; filename="speech.{extension}"',
     }
-    if streaming_enabled:
-        return StreamingResponse(_chunk_bytes(audio_bytes), media_type=media_type, headers=headers)
-
-    return Response(content=audio_bytes, media_type=media_type, headers=headers)
+    return StreamingResponse(iter([audio_bytes]), media_type=media_type, headers=headers)
 
 
 @app.get("/health", summary="Health check")
@@ -663,7 +587,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface to bind the server.")
     parser.add_argument("--port", type=int, default=8000, help="Port to expose the API.")
     parser.add_argument("--voices_dir", type=Path, default=Path(__file__).resolve().parent / "voices", help="Directory containing voice preset audio files.")
-    parser.add_argument("--output_dir", type=Path, default=Path(__file__).resolve().parent / "output", help="Directory to store generated MP3 files.")
     parser.add_argument("--cfg_scale", type=float, default=1.3, help="Default CFG scale to use for synthesis.")
     parser.add_argument("--inference_steps", type=int, default=5, help="Number of diffusion inference steps.")
     return parser.parse_args()
@@ -681,7 +604,6 @@ def main() -> None:
         host=args.host,
         port=args.port,
         voices_dir=args.voices_dir,
-        output_dir=args.output_dir,
         default_cfg_scale=args.cfg_scale,
         inference_steps=args.inference_steps,
     )

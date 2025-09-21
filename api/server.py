@@ -14,7 +14,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
@@ -497,6 +497,27 @@ def _resolve_cfg_scale(requested: Optional[float], default_value: float) -> floa
     if requested <= 0:
         raise HTTPException(status_code=400, detail="cfg_scale must be greater than zero.")
     return requested
+
+
+@app.options("/v1/audio/speech")
+async def options_speech(request: Request) -> Response:
+    """Handle CORS preflight requests for the speech synthesis endpoint."""
+
+    origin = request.headers.get("origin") or "*"
+    request_headers = request.headers.get("access-control-request-headers")
+
+    headers = {
+        "Allow": "OPTIONS, POST",
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "OPTIONS, POST",
+    }
+
+    if request_headers:
+        headers["Access-Control-Allow-Headers"] = request_headers
+    else:
+        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+
+    return Response(status_code=204, headers=headers)
 
 
 @app.post("/v1/audio/speech")

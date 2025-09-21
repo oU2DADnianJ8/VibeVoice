@@ -57,6 +57,7 @@ uvicorn api.server:app --host 0.0.0.0 --port 8000
 | CFG scale | `--cfg_scale` | `VIBEVOICE_CFG_SCALE` | `1.3` |
 | Diffusion inference steps | `--inference_steps` | `VIBEVOICE_INFERENCE_STEPS` | `5` |
 | Voices directory | `--voices_dir` | `VIBEVOICE_VOICES_DIR` | `api/voices` |
+| Output directory for generated MP3 files | `--output_dir` | `VIBEVOICE_OUTPUT_DIR` | `api/output` |
 
 ## API Usage
 
@@ -68,10 +69,11 @@ Send a POST request to `/v1/audio/speech` with a JSON body mirroring the OpenAI 
   "input": "Hello from VibeVoice!",
   "voice": "en-Alice_woman",
   "response_format": "mp3",
-  "cfg_scale": 1.3
+  "cfg_scale": 1.3,
+  "stream": true
 }
 ```
 
-The response streams the synthesized audio using the requested format. Supported `response_format` values are `mp3`, `wav`, and `flac`.
+The response streams the synthesized audio using the requested format by default (set `"stream": false` to receive a non-streaming response). Supported `response_format` values are `mp3`, `wav`, and `flac`. Every request also writes an MP3 copy of the audio to the `api/output` directory (or the directory configured via `--output_dir`).
 
 Errors are returned in JSON with appropriate HTTP status codes if the input is invalid, a voice preset is missing, or speech synthesis fails.
